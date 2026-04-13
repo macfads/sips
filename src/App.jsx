@@ -1,7 +1,7 @@
 import { useState, useRef, useCallback, useEffect } from "react";
 
-const PINT_CALS = 220;
-const CAL_PER_STEP = 0.04;
+const PINT_CALS = 230;
+function stepCals(steps, weightKg) { return steps * 0.04 * (weightKg / 70); }
 const STEP_TARGET = 10000;
 
 /* ── Utils ── */
@@ -169,7 +169,7 @@ function LogScreen({type,profile,onSave,onBack}){
 /* ── Home Tab ── */
 function HomeTab({profile,activities,pedometer,manualSteps,onSetManualSteps,onNavigate,onEditProfile}){
   const totalSteps=manualSteps+(pedometer.active?pedometer.steps:0);
-  const stepCal=totalSteps*CAL_PER_STEP;
+  const stepCal=stepCals(totalSteps,profile.weight);
   const actCal=activities.reduce((s,a)=>s+a.cals,0);
   const totalCal=stepCal+actCal;const totalP=totalCal/PINT_CALS;
   const[editing,setEditing]=useState(false);
@@ -273,7 +273,7 @@ function HistoryTab({profile}){
       ):(
         <div style={{display:"flex",flexDirection:"column",gap:16}}>
           {history.map(day=>{
-            const dayCals=day.activities.reduce((s,a)=>s+a.cals,0)+(day.steps||0)*CAL_PER_STEP;
+            const dayCals=day.activities.reduce((s,a)=>s+a.cals,0)+stepCals(day.steps||0,weight);
             const dayPints=dayCals/PINT_CALS;
             return(
               <div key={day.date}>
@@ -293,11 +293,11 @@ function HistoryTab({profile}){
                       <span style={{fontSize:20}}>👟</span>
                       <div>
                         <div style={{fontSize:13,fontWeight:600,color:"#FAFAF9"}}>{day.steps.toLocaleString()} steps</div>
-                        <div style={{fontSize:10,color:dimr}}>{Math.round(day.steps*CAL_PER_STEP)} cal</div>
+                        <div style={{fontSize:10,color:dimr}}>{Math.round(stepCals(day.steps,weight))} cal</div>
                       </div>
                     </div>
                     <div style={{textAlign:"right"}}>
-                      <div style={{fontFamily:S,fontSize:16,fontWeight:900,color:amberL,lineHeight:1}}>{(day.steps*CAL_PER_STEP/PINT_CALS).toFixed(1)}</div>
+                      <div style={{fontFamily:S,fontSize:16,fontWeight:900,color:amberL,lineHeight:1}}>{(stepCals(day.steps,weight)/PINT_CALS).toFixed(1)}</div>
                       <div style={{fontSize:9,color:dim,fontWeight:600}}>pints</div>
                     </div>
                   </div>
@@ -467,7 +467,7 @@ export default function App(){
   const pedometer=usePedometer();
 
   const totalSteps=manualSteps+(pedometer.active?pedometer.steps:0);
-  const stepCal=totalSteps*CAL_PER_STEP;
+  const stepCal=stepCals(totalSteps,profile?.weight||70);
   const actCal=activities.reduce((s,a)=>s+a.cals,0);
   const totalPints=(stepCal+actCal)/PINT_CALS;
 
