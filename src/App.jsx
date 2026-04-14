@@ -1,4 +1,6 @@
 import { useState, useRef, useCallback, useEffect } from "react";
+import { db } from "./firebase";
+import { doc, getDoc, setDoc, onSnapshot, collection } from "firebase/firestore";
 
 const PINT_CALS = 230;
 function stepCals(steps, weightKg) { return steps * 0.04 * (weightKg / 70); }
@@ -10,7 +12,7 @@ function cycleCal(w,d,t,e){const s=d/(t/60);const m=s<16?4:s<19?6.8:s<22?8:s<26?
 function weekKey(){const d=new Date();const j=new Date(d.getFullYear(),0,1);const days=Math.floor((d-j)/86400000);return`${d.getFullYear()}-W${String(Math.ceil((days+j.getDay()+1)/7)).padStart(2,"0")}`;}
 function todayKey(){return new Date().toISOString().slice(0,10);}
 function genCode(){const c="ABCDEFGHJKLMNPQRSTUVWXYZ23456789";let r="";for(let i=0;i<6;i++)r+=c[Math.floor(Math.random()*c.length)];return r;}
-function formatDate(d){const dt=new Date(d+"T00:00:00");const opts={weekday:"short",day:"numeric",month:"short"};return dt.toLocaleDateString("en-GB",opts);}
+function formatDate(d){const dt=new Date(d+"T00:00:00");return dt.toLocaleDateString("en-GB",{weekday:"short",day:"numeric",month:"short"});}
 function isToday(d){return d===todayKey();}
 
 /* ── Pedometer ── */
@@ -22,11 +24,27 @@ function usePedometer(){
   return{steps,active};
 }
 
-/* ── Storage ── */
+/* ── Local Storage ── */
 function useStored(key,init){
   const[val,setVal]=useState(()=>{try{const s=localStorage.getItem(key);return s?JSON.parse(s):init;}catch{return init;}});
   const set=useCallback((v)=>{setVal(prev=>{const n=typeof v==="function"?v(prev):v;try{localStorage.setItem(key,JSON.stringify(n));}catch{}return n;});},[key]);
   return[val,set,true];
+}
+
+/* ── Firebase helpers ── */
+async function syncUserToFirebase(profile){
+  if(!profile?.code)return;
+  try{await setDoc(doc(db,"users",profile.code),{name:profile.name,code:profile.code},{merge:true});}catch(e){console.log("Firebase sync error:",e);}
+}
+
+async function syncPintsToFirebase(code,name,pints){
+  if(!code)return;
+  const wk=weekKey();
+  try{await setDoc(doc(db,"weeks",wk,"scores",code),{name,code,pints:Math.round(pints*10)/10,updated:Date.now()},{merge:true});}catch(e){console.log("Firebase pints sync error:",e);}
+}
+
+async function lookupUserByCode(code){
+  try{const snap=await getDoc(doc(db,"users",code));if(snap.exists())return snap.data();return null;}catch{return null;}
 }
 
 /* ── History helpers ── */
@@ -38,24 +56,15 @@ function getAllHistory(){
       const date=k.replace("sips-activities-","");
       try{const acts=JSON.parse(localStorage.getItem(k));if(acts&&acts.length)entries.push({date,activities:acts});}catch{}
     }
-    if(k.startsWith("sips-steps-")){
-      const date=k.replace("sips-steps-","");
-      try{const steps=JSON.parse(localStorage.getItem(k));if(steps>0){
-        const existing=entries.find(e=>e.date===date);
-        if(existing)existing.steps=steps;
-        else entries.push({date,activities:[],steps});
-      }}catch{}
-    }
   }
-  // Merge step data into activity entries
   for(let i=0;i<localStorage.length;i++){
     const k=localStorage.key(i);
     if(k.startsWith("sips-steps-")){
       const date=k.replace("sips-steps-","");
       try{const steps=JSON.parse(localStorage.getItem(k));if(steps>0){
         const existing=entries.find(e=>e.date===date);
-        if(existing&&!existing.steps)existing.steps=steps;
-        else if(!existing)entries.push({date,activities:[],steps});
+        if(existing)existing.steps=steps;
+        else entries.push({date,activities:[],steps});
       }}catch{}
     }
   }
@@ -175,10 +184,7 @@ function HomeTab({profile,activities,pedometer,manualSteps,onSetManualSteps,onNa
   const[editing,setEditing]=useState(false);
   const[stepInput,setStepInput]=useState("");
 
-  const saveSteps=()=>{
-    const v=parseInt(stepInput)||0;
-    if(v>=0){onSetManualSteps(v);setEditing(false);}
-  };
+  const saveSteps=()=>{const v=parseInt(stepInput)||0;if(v>=0){onSetManualSteps(v);setEditing(false);}};
 
   return(
     <div style={{padding:"28px 20px 120px",maxWidth:420,margin:"0 auto"}}>
@@ -187,12 +193,10 @@ function HomeTab({profile,activities,pedometer,manualSteps,onSetManualSteps,onNa
         <button onClick={onEditProfile} style={{background:"#1E1C1A",border:"1px solid #2A2725",borderRadius:8,padding:"6px 12px",color:dim,fontSize:10,cursor:"pointer",fontFamily:F,fontWeight:700,letterSpacing:"0.06em",textTransform:"uppercase"}}>{profile.name}</button>
       </div>
 
-      {/* Step ring + manual entry */}
       <div style={{background:card,border:`1px solid ${cardB}`,borderRadius:24,padding:"32px 20px 24px",marginBottom:14}}>
         <StepRing steps={totalSteps}/>
         {totalSteps>0&&<p style={{textAlign:"center",fontSize:12,color:dim,margin:"14px 0 0"}}>{(stepCal/PINT_CALS).toFixed(1)} pints from steps · {Math.round(stepCal)} cal</p>}
 
-        {/* Step entry */}
         {editing?(
           <div style={{display:"flex",gap:8,marginTop:16}}>
             <input type="number" placeholder="e.g. 8500" value={stepInput} onChange={e=>setStepInput(e.target.value)}
@@ -206,7 +210,6 @@ function HomeTab({profile,activities,pedometer,manualSteps,onSetManualSteps,onNa
             width:"100%",marginTop:16,padding:"12px",
             background:"#1E1C1A",border:"1px solid #2A2725",borderRadius:12,
             color:dim,fontSize:12,fontWeight:600,cursor:"pointer",fontFamily:F,
-            transition:"border-color 0.2s",
           }}>
             <span style={{fontSize:16}}>👟</span>
             {manualSteps>0?`Update step count (${manualSteps.toLocaleString()} from Health)`:"Enter steps from Health app"}
@@ -219,13 +222,11 @@ function HomeTab({profile,activities,pedometer,manualSteps,onSetManualSteps,onNa
         </div>}
       </div>
 
-      {/* Total pints */}
       <div style={{background:"linear-gradient(135deg,rgba(245,158,11,0.06),rgba(217,119,6,0.03))",border:"1px solid rgba(245,158,11,0.12)",borderRadius:18,padding:"22px 20px",marginBottom:14,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
         <div><div style={{fontSize:10,color:amber,textTransform:"uppercase",letterSpacing:"0.12em",fontWeight:700,marginBottom:2}}>Total earned</div><div style={{fontSize:12,color:dim}}>{Math.round(totalCal)} calories burned</div></div>
         <div style={{textAlign:"right"}}><div style={{fontFamily:S,fontSize:36,fontWeight:900,color:amberL,lineHeight:1}}>{totalP.toFixed(1)}</div><div style={{fontSize:10,color:amber,fontWeight:600,letterSpacing:"0.06em"}}>PINTS</div></div>
       </div>
 
-      {/* Log buttons */}
       <div style={{display:"flex",gap:10,marginBottom:24}}>
         {[["run","🏃","Log Run"],["cycle","🚴","Log Ride"]].map(([id,ic,lb])=>(
           <button key={id} onClick={()=>onNavigate(id)} style={{flex:1,background:card,border:`1px solid ${cardB}`,borderRadius:14,padding:"20px 12px",cursor:"pointer",display:"flex",flexDirection:"column",alignItems:"center",gap:8,transition:"all 0.2s"}}>
@@ -235,7 +236,6 @@ function HomeTab({profile,activities,pedometer,manualSteps,onSetManualSteps,onNa
         ))}
       </div>
 
-      {/* Today's activities */}
       {activities.length>0&&<>
         <div style={{fontSize:10,color:dim,textTransform:"uppercase",letterSpacing:"0.12em",fontWeight:700,marginBottom:10}}>Today's Activities</div>
         <div style={{display:"flex",flexDirection:"column",gap:6}}>
@@ -277,7 +277,6 @@ function HistoryTab({profile}){
             const dayPints=dayCals/PINT_CALS;
             return(
               <div key={day.date}>
-                {/* Day header */}
                 <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
                   <div style={{display:"flex",alignItems:"center",gap:8}}>
                     <span style={{fontSize:13,fontWeight:700,color:isToday(day.date)?"#FAFAF9":"#D6D3D1"}}>{isToday(day.date)?"Today":formatDate(day.date)}</span>
@@ -286,7 +285,6 @@ function HistoryTab({profile}){
                   <span style={{fontFamily:S,fontSize:16,fontWeight:900,color:amberL}}>{dayPints.toFixed(1)} <span style={{fontSize:9,color:dim,fontWeight:600}}>pints</span></span>
                 </div>
 
-                {/* Step count for this day */}
                 {day.steps>0&&(
                   <div style={{background:card,border:`1px solid ${cardB}`,borderRadius:12,padding:"12px 16px",marginBottom:6,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
                     <div style={{display:"flex",alignItems:"center",gap:10}}>
@@ -303,7 +301,6 @@ function HistoryTab({profile}){
                   </div>
                 )}
 
-                {/* Activities */}
                 <div style={{display:"flex",flexDirection:"column",gap:6}}>
                   {day.activities.map((a,i)=>(
                     <div key={i} style={{background:card,border:`1px solid ${cardB}`,borderRadius:12,padding:"12px 16px",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
@@ -330,35 +327,63 @@ function HistoryTab({profile}){
   );
 }
 
-/* ── Leaderboard Tab ── */
+/* ── Leaderboard Tab (Firebase) ── */
 function LeaderboardTab({profile,weeklyPints}){
   const[friends,setFriends]=useStored("sips-friends",[]);
   const[addCode,setAddCode]=useState("");
   const[addName,setAddName]=useState("");
   const[copied,setCopied]=useState(false);
   const[showAdd,setShowAdd]=useState(false);
+  const[board,setBoard]=useState([]);
+  const[loading,setLoading]=useState(true);
+  const[addError,setAddError]=useState("");
+  const[addLoading,setAddLoading]=useState(false);
   const wk=weekKey();
 
-  const board=[
-    {code:profile.code,name:profile.name||"You",pints:weeklyPints,isMe:true},
-    ...friends.map(f=>({code:f.code,name:f.name||f.code,pints:f.pints||0,isMe:false}))
-  ].sort((a,b)=>b.pints-a.pints);
+  // Listen to all scores in this week's collection
+  useEffect(()=>{
+    const unsub=onSnapshot(collection(db,"weeks",wk,"scores"),(snap)=>{
+      const scores={};
+      snap.forEach(d=>{const data=d.data();scores[data.code]={name:data.name,pints:data.pints||0};});
 
-  const addFriend=()=>{
+      // Build board: me + friends, pulling live scores from Firebase
+      const entries=[{code:profile.code,name:profile.name||"You",pints:scores[profile.code]?.pints||weeklyPints,isMe:true}];
+      for(const f of friends){
+        const fb=scores[f.code];
+        entries.push({code:f.code,name:fb?.name||f.name||f.code,pints:fb?.pints||0,isMe:false});
+      }
+      entries.sort((a,b)=>b.pints-a.pints);
+      setBoard(entries);
+      setLoading(false);
+    },(err)=>{
+      console.log("Firestore listen error:",err);
+      // Fallback to local data
+      const entries=[{code:profile.code,name:profile.name,pints:weeklyPints,isMe:true},...friends.map(f=>({code:f.code,name:f.name||f.code,pints:0,isMe:false}))];
+      entries.sort((a,b)=>b.pints-a.pints);
+      setBoard(entries);
+      setLoading(false);
+    });
+    return()=>unsub();
+  },[friends,profile.code,profile.name,weeklyPints,wk]);
+
+  const addFriend=async()=>{
     const code=addCode.trim().toUpperCase();
-    const name=addName.trim()||code;
-    if(!code||code.length!==6||code===profile.code||friends.find(f=>f.code===code))return;
-    setFriends(prev=>[...prev,{code,name,pints:0}]);
-    setAddCode("");setAddName("");setShowAdd(false);
+    if(!code||code.length!==6){setAddError("Code must be 6 characters");return;}
+    if(code===profile.code){setAddError("That's your own code!");return;}
+    if(friends.find(f=>f.code===code)){setAddError("Already added");return;}
+
+    setAddLoading(true);setAddError("");
+    // Look up name from Firebase
+    const user=await lookupUserByCode(code);
+    const name=user?.name||addName.trim()||code;
+
+    setFriends(prev=>[...prev,{code,name}]);
+    setAddCode("");setAddName("");setShowAdd(false);setAddLoading(false);
   };
 
-  const removeFriend=(code)=>{
-    setFriends(prev=>prev.filter(f=>f.code!==code));
-  };
+  const removeFriend=(code)=>{setFriends(prev=>prev.filter(f=>f.code!==code));};
 
-  const copyCode=()=>{
-    navigator.clipboard?.writeText(profile.code).then(()=>{setCopied(true);setTimeout(()=>setCopied(false),2000);}).catch(()=>{});
-  };
+  const copyCode=()=>{navigator.clipboard?.writeText(profile.code).then(()=>{setCopied(true);setTimeout(()=>setCopied(false),2000);}).catch(()=>{});};
 
   const medals=["🥇","🥈","🥉"];
 
@@ -367,67 +392,66 @@ function LeaderboardTab({profile,weeklyPints}){
       <h1 style={{fontFamily:S,fontSize:22,fontWeight:900,margin:"0 0 6px",color:"#FAFAF9"}}>Leaderboard</h1>
       <p style={{fontSize:11,color:dimr,margin:"0 0 24px",textTransform:"uppercase",letterSpacing:"0.1em",fontWeight:600}}>Weekly rankings · {wk}</p>
 
-      {/* Your code */}
       <div style={{background:card,border:`1px solid ${cardB}`,borderRadius:16,padding:"16px 18px",marginBottom:16,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
         <div>
           <div style={{fontSize:10,color:dim,textTransform:"uppercase",letterSpacing:"0.1em",fontWeight:700,marginBottom:4}}>Your friend code</div>
           <div style={{fontFamily:"'Courier New',monospace",fontSize:22,fontWeight:700,color:amberL,letterSpacing:"0.2em"}}>{profile.code}</div>
         </div>
-        <button onClick={copyCode} style={{background:"rgba(245,158,11,0.08)",border:"1px solid rgba(245,158,11,0.15)",borderRadius:10,padding:"10px 16px",color:amberL,fontSize:12,fontWeight:700,cursor:"pointer",fontFamily:F,transition:"all 0.2s"}}>
+        <button onClick={copyCode} style={{background:"rgba(245,158,11,0.08)",border:"1px solid rgba(245,158,11,0.15)",borderRadius:10,padding:"10px 16px",color:amberL,fontSize:12,fontWeight:700,cursor:"pointer",fontFamily:F}}>
           {copied?"Copied!":"Copy"}
         </button>
       </div>
 
-      {/* Add friend */}
       {showAdd?(
         <div style={{background:card,border:`1px solid ${cardB}`,borderRadius:16,padding:"18px",marginBottom:20}}>
           <div style={{fontSize:10,color:dim,textTransform:"uppercase",letterSpacing:"0.1em",fontWeight:700,marginBottom:12}}>Add a friend</div>
           <div style={{display:"flex",flexDirection:"column",gap:10}}>
-            <div><label style={{...lbl,marginBottom:4}}>Their Name</label><input type="text" placeholder="e.g. Dave" value={addName} onChange={e=>setAddName(e.target.value)} style={inp}/></div>
-            <div><label style={{...lbl,marginBottom:4}}>Their Code</label><input type="text" placeholder="ABC123" value={addCode} onChange={e=>setAddCode(e.target.value.toUpperCase())} maxLength={6} style={{...inp,fontFamily:"'Courier New',monospace",letterSpacing:"0.15em",textTransform:"uppercase"}}/></div>
+            <div><label style={{...lbl,marginBottom:4}}>Their Code</label><input type="text" placeholder="ABC123" value={addCode} onChange={e=>{setAddCode(e.target.value.toUpperCase());setAddError("");}} maxLength={6} style={{...inp,fontFamily:"'Courier New',monospace",letterSpacing:"0.15em",textTransform:"uppercase"}}/></div>
+            {addError&&<p style={{color:"#EF4444",fontSize:12,margin:0}}>{addError}</p>}
             <div style={{display:"flex",gap:8}}>
-              <button onClick={addFriend} style={{flex:1,...btnP(addCode.length===6&&addName.trim()),padding:"12px"}}>Add Friend</button>
-              <button onClick={()=>{setShowAdd(false);setAddCode("");setAddName("");}} style={{background:"#1E1C1A",border:"1px solid #2A2725",borderRadius:12,padding:"12px 18px",color:dim,fontSize:13,cursor:"pointer",fontFamily:F,fontWeight:600}}>Cancel</button>
+              <button onClick={addFriend} disabled={addLoading} style={{flex:1,...btnP(addCode.length===6),padding:"12px",opacity:addLoading?0.6:1}}>
+                {addLoading?"Looking up...":"Add Friend"}
+              </button>
+              <button onClick={()=>{setShowAdd(false);setAddCode("");setAddName("");setAddError("");}} style={{background:"#1E1C1A",border:"1px solid #2A2725",borderRadius:12,padding:"12px 18px",color:dim,fontSize:13,cursor:"pointer",fontFamily:F,fontWeight:600}}>Cancel</button>
             </div>
           </div>
         </div>
       ):(
-        <button onClick={()=>setShowAdd(true)} style={{width:"100%",background:card,border:`1px dashed ${cardB}`,borderRadius:14,padding:"16px",cursor:"pointer",color:dim,fontSize:13,fontWeight:600,fontFamily:F,marginBottom:20,transition:"border-color 0.2s"}}>
+        <button onClick={()=>setShowAdd(true)} style={{width:"100%",background:card,border:`1px dashed ${cardB}`,borderRadius:14,padding:"16px",cursor:"pointer",color:dim,fontSize:13,fontWeight:600,fontFamily:F,marginBottom:20}}>
           + Add a friend
         </button>
       )}
 
-      {/* Board */}
-      <div style={{display:"flex",flexDirection:"column",gap:6}}>
-        {board.map((entry,i)=>(
-          <div key={entry.code} style={{
-            background:entry.isMe?"rgba(245,158,11,0.04)":card,
-            border:entry.isMe?"1px solid rgba(245,158,11,0.15)":`1px solid ${cardB}`,
-            borderRadius:14,padding:"14px 16px",display:"flex",alignItems:"center",gap:14,
-          }}>
-            <div style={{width:32,textAlign:"center"}}>
-              {i<3?<span style={{fontSize:22}}>{medals[i]}</span>:<span style={{fontFamily:S,fontSize:18,fontWeight:900,color:dimr}}>{i+1}</span>}
-            </div>
-            <div style={{flex:1}}>
-              <div style={{fontSize:14,fontWeight:600,color:entry.isMe?"#FAFAF9":"#D6D3D1"}}>
-                {entry.name}{entry.isMe&&<span style={{fontSize:10,color:amber,marginLeft:6,fontWeight:700}}>YOU</span>}
+      {loading?(
+        <p style={{textAlign:"center",color:dimr,fontSize:13}}>Loading scores...</p>
+      ):(
+        <div style={{display:"flex",flexDirection:"column",gap:6}}>
+          {board.map((entry,i)=>(
+            <div key={entry.code} style={{
+              background:entry.isMe?"rgba(245,158,11,0.04)":card,
+              border:entry.isMe?"1px solid rgba(245,158,11,0.15)":`1px solid ${cardB}`,
+              borderRadius:14,padding:"14px 16px",display:"flex",alignItems:"center",gap:14,
+            }}>
+              <div style={{width:32,textAlign:"center"}}>
+                {i<3?<span style={{fontSize:22}}>{medals[i]}</span>:<span style={{fontFamily:S,fontSize:18,fontWeight:900,color:dimr}}>{i+1}</span>}
               </div>
-              {!entry.isMe&&<div style={{fontSize:10,color:dimr,fontFamily:"'Courier New',monospace",letterSpacing:"0.08em"}}>{entry.code}</div>}
-            </div>
-            <div style={{display:"flex",alignItems:"center",gap:10}}>
-              <div style={{textAlign:"right"}}>
-                <div style={{fontFamily:S,fontSize:22,fontWeight:900,color:i===0?amberL:"#A8A29E",lineHeight:1}}>{entry.pints.toFixed(1)}</div>
-                <div style={{fontSize:9,color:dim,fontWeight:600}}>pints</div>
+              <div style={{flex:1}}>
+                <div style={{fontSize:14,fontWeight:600,color:entry.isMe?"#FAFAF9":"#D6D3D1"}}>
+                  {entry.name}{entry.isMe&&<span style={{fontSize:10,color:amber,marginLeft:6,fontWeight:700}}>YOU</span>}
+                </div>
+                {!entry.isMe&&<div style={{fontSize:10,color:dimr,fontFamily:"'Courier New',monospace",letterSpacing:"0.08em"}}>{entry.code}</div>}
               </div>
-              {!entry.isMe&&<button onClick={()=>removeFriend(entry.code)} style={{background:"none",border:"none",color:"#44403C",fontSize:16,cursor:"pointer",padding:"4px",lineHeight:1}}>✕</button>}
+              <div style={{display:"flex",alignItems:"center",gap:10}}>
+                <div style={{textAlign:"right"}}>
+                  <div style={{fontFamily:S,fontSize:22,fontWeight:900,color:i===0?amberL:"#A8A29E",lineHeight:1}}>{entry.pints.toFixed(1)}</div>
+                  <div style={{fontSize:9,color:dim,fontWeight:600}}>pints</div>
+                </div>
+                {!entry.isMe&&<button onClick={()=>removeFriend(entry.code)} style={{background:"none",border:"none",color:"#44403C",fontSize:16,cursor:"pointer",padding:"4px",lineHeight:1}}>✕</button>}
+              </div>
             </div>
-          </div>
-        ))}
-      </div>
-
-      <p style={{textAlign:"center",color:dimr,fontSize:10,margin:"24px 0 0",lineHeight:1.6}}>
-        Leaderboard scores are local for now.<br/>Firebase sync coming soon.
-      </p>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
@@ -471,7 +495,19 @@ export default function App(){
   const actCal=activities.reduce((s,a)=>s+a.cals,0);
   const totalPints=(stepCal+actCal)/PINT_CALS;
 
-  const saveProfile=(p)=>{if(!p.code)p.code=genCode();setProfile(p);setScreen("app");};
+  // Sync to Firebase whenever pints change
+  useEffect(()=>{
+    if(!profile?.code)return;
+    const total=totalPints+weekAct;
+    syncPintsToFirebase(profile.code,profile.name,total);
+  },[profile,totalPints,weekAct]);
+
+  const saveProfile=(p)=>{
+    if(!p.code)p.code=genCode();
+    setProfile(p);
+    syncUserToFirebase(p);
+    setScreen("app");
+  };
   const saveLog=(a)=>{
     setActivities(prev=>[a,...prev]);
     setWeekAct(prev=>prev+(a.cals/PINT_CALS));
@@ -489,12 +525,8 @@ export default function App(){
           onNavigate={(s)=>{if(s==="run"||s==="cycle")setScreen("log-"+s);else setTab(s);}}
           onEditProfile={()=>setScreen("profile")}/>
       )}
-      {screen==="app"&&tab==="history"&&profile&&(
-        <HistoryTab profile={profile}/>
-      )}
-      {screen==="app"&&tab==="board"&&profile&&(
-        <LeaderboardTab profile={profile} weeklyPints={totalPints+weekAct}/>
-      )}
+      {screen==="app"&&tab==="history"&&profile&&<HistoryTab profile={profile}/>}
+      {screen==="app"&&tab==="board"&&profile&&<LeaderboardTab profile={profile} weeklyPints={totalPints+weekAct}/>}
       {(screen==="log-run"||screen==="log-cycle")&&profile&&(
         <LogScreen type={screen.replace("log-","")} profile={profile} onSave={saveLog} onBack={()=>setScreen("app")}/>
       )}
