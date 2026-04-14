@@ -15,13 +15,65 @@ function genCode(){const c="ABCDEFGHJKLMNPQRSTUVWXYZ23456789";let r="";for(let i
 function formatDate(d){const dt=new Date(d+"T00:00:00");return dt.toLocaleDateString("en-GB",{weekday:"short",day:"numeric",month:"short"});}
 function isToday(d){return d===todayKey();}
 
-/* ── Pedometer ── */
+/* ── Pedometer (HealthKit on native, DeviceMotion fallback on web) ── */
 function usePedometer(){
-  const[steps,setSteps]=useState(0);const[active,setActive]=useState(false);
+  const[steps,setSteps]=useState(0);
+  const[active,setActive]=useState(false);
+  const[source,setSource]=useState("none"); // "healthkit" | "motion" | "none"
   const ref=useRef({steps:0,lp:0,ab:false});
+
+  // DeviceMotion handler (web fallback)
   const hm=useCallback((e)=>{const a=e.accelerationIncludingGravity;if(!a||a.x==null)return;const mag=Math.sqrt(a.x**2+a.y**2+a.z**2);const now=Date.now();const r=ref.current;if(mag>12.5&&!r.ab){r.ab=true;if(now-r.lp>300){r.lp=now;r.steps++;setSteps(r.steps);}}if(mag<11)r.ab=false;},[]);
-  useEffect(()=>{let ok=false;(async()=>{if(typeof DeviceMotionEvent!=="undefined"&&typeof DeviceMotionEvent.requestPermission==="function"){try{const p=await DeviceMotionEvent.requestPermission();if(p!=="granted")return;}catch{return;}}if(!window.DeviceMotionEvent)return;window.addEventListener("devicemotion",hm);ok=true;setActive(true);})();return()=>{if(ok)window.removeEventListener("devicemotion",hm);};},[hm]);
-  return{steps,active};
+
+  useEffect(()=>{
+    let interval=null;let motionOk=false;
+
+    async function tryHealthKit(){
+      try{
+        const cap=window.Capacitor;
+        if(!cap||!cap.isNativePlatform||!cap.isNativePlatform())return false;
+
+        const HK=cap.Plugins?.HealthKit;
+        if(!HK)return false;
+
+        await HK.requestAuthorization();
+
+        async function readSteps(){
+          const result=await HK.getSteps();
+          setSteps(result.steps||0);
+        }
+
+        await readSteps();
+        setActive(true);
+        setSource("healthkit");
+        interval=setInterval(readSteps,30000);
+        return true;
+      }catch(e){
+        console.log("HealthKit not available:",e);
+        return false;
+      }
+    }
+
+    async function tryDeviceMotion(){
+      if(typeof DeviceMotionEvent!=="undefined"&&typeof DeviceMotionEvent.requestPermission==="function"){
+        try{const p=await DeviceMotionEvent.requestPermission();if(p!=="granted")return;}catch{return;}
+      }
+      if(!window.DeviceMotionEvent)return;
+      window.addEventListener("devicemotion",hm);motionOk=true;setActive(true);setSource("motion");
+    }
+
+    (async()=>{
+      const hkOk=await tryHealthKit();
+      if(!hkOk)await tryDeviceMotion();
+    })();
+
+    return()=>{
+      if(interval)clearInterval(interval);
+      if(motionOk)window.removeEventListener("devicemotion",hm);
+    };
+  },[hm]);
+
+  return{steps,active,source};
 }
 
 /* ── Local Storage ── */
@@ -87,7 +139,7 @@ function useFriendRequests(myCode){
       const reqs=[];
       snap.forEach(d=>reqs.push({id:d.id,...d.data()}));
       setIncoming(reqs);
-    },()=>{});
+    },(err)=>{console.error("Incoming requests query error:",err);});
 
     // Listen for requests FROM me that got accepted (so I can auto-add them)
     const q2=query(collection(db,"requests"),where("from","==",myCode),where("status","==","accepted"));
@@ -95,7 +147,7 @@ function useFriendRequests(myCode){
       const accepted=[];
       snap.forEach(d=>accepted.push({id:d.id,...d.data()}));
       setNewFriends(accepted);
-    },()=>{});
+    },(err)=>{console.error("Accepted requests query error:",err);});
 
     return()=>{unsub1();unsub2();};
   },[myCode]);
@@ -233,7 +285,8 @@ function LogScreen({type,profile,onSave,onBack}){
 
 /* ── Home Tab ── */
 function HomeTab({profile,activities,pedometer,manualSteps,onSetManualSteps,onNavigate,onEditProfile}){
-  const totalSteps=manualSteps+(pedometer.active?pedometer.steps:0);
+  const isHealthKit=pedometer.source==="healthkit";
+  const totalSteps=isHealthKit?pedometer.steps:(manualSteps+(pedometer.active?pedometer.steps:0));
   const stepCal=stepCals(totalSteps,profile.weight);
   const actCal=activities.reduce((s,a)=>s+a.cals,0);
   const totalCal=stepCal+actCal;const totalP=totalCal/PINT_CALS;
@@ -250,19 +303,33 @@ function HomeTab({profile,activities,pedometer,manualSteps,onSetManualSteps,onNa
       <div style={{background:card,border:`1px solid ${cardB}`,borderRadius:24,padding:"32px 20px 24px",marginBottom:14}}>
         <StepRing steps={totalSteps}/>
         {totalSteps>0&&<p style={{textAlign:"center",fontSize:12,color:dim,margin:"14px 0 0"}}>{(stepCal/PINT_CALS).toFixed(1)} pints from steps · {Math.round(stepCal)} cal</p>}
-        {editing?(
-          <div style={{display:"flex",gap:8,marginTop:16}}>
-            <input type="number" placeholder="e.g. 8500" value={stepInput} onChange={e=>setStepInput(e.target.value)} style={{...inp,flex:1,textAlign:"center"}} inputMode="numeric" autoFocus/>
-            <button onClick={saveSteps} style={{background:`linear-gradient(135deg,${amberL},${amber})`,border:"none",borderRadius:10,padding:"0 20px",color:"#0A0908",fontSize:13,fontWeight:700,cursor:"pointer",fontFamily:F}}>Save</button>
-            <button onClick={()=>setEditing(false)} style={{background:"#1E1C1A",border:"1px solid #2A2725",borderRadius:10,padding:"0 14px",color:dim,fontSize:13,cursor:"pointer",fontFamily:F}}>✕</button>
+
+        {/* HealthKit active — auto-syncing */}
+        {isHealthKit&&(
+          <div style={{display:"flex",alignItems:"center",justifyContent:"center",gap:6,marginTop:14}}>
+            <span style={{width:5,height:5,borderRadius:"50%",background:"#22C55E",boxShadow:"0 0 6px #22C55E",animation:"pulse 1.5s infinite"}}/>
+            <span style={{fontSize:10,color:"#4ADE80",fontWeight:600,letterSpacing:"0.06em",textTransform:"uppercase"}}>Synced from Health app</span>
           </div>
-        ):(
-          <button onClick={()=>{setStepInput(String(manualSteps||""));setEditing(true);}} style={{display:"flex",alignItems:"center",justifyContent:"center",gap:8,width:"100%",marginTop:16,padding:"12px",background:"#1E1C1A",border:"1px solid #2A2725",borderRadius:12,color:dim,fontSize:12,fontWeight:600,cursor:"pointer",fontFamily:F}}>
-            <span style={{fontSize:16}}>👟</span>
-            {manualSteps>0?`Update step count (${manualSteps.toLocaleString()} from Health)`:"Enter steps from Health app"}
-          </button>
         )}
-        {pedometer.active&&<div style={{display:"flex",alignItems:"center",justifyContent:"center",gap:5,marginTop:12}}>
+
+        {/* Manual entry — only when HealthKit is NOT available */}
+        {!isHealthKit&&(
+          editing?(
+            <div style={{display:"flex",gap:8,marginTop:16}}>
+              <input type="number" placeholder="e.g. 8500" value={stepInput} onChange={e=>setStepInput(e.target.value)} style={{...inp,flex:1,textAlign:"center"}} inputMode="numeric" autoFocus/>
+              <button onClick={saveSteps} style={{background:`linear-gradient(135deg,${amberL},${amber})`,border:"none",borderRadius:10,padding:"0 20px",color:"#0A0908",fontSize:13,fontWeight:700,cursor:"pointer",fontFamily:F}}>Save</button>
+              <button onClick={()=>setEditing(false)} style={{background:"#1E1C1A",border:"1px solid #2A2725",borderRadius:10,padding:"0 14px",color:dim,fontSize:13,cursor:"pointer",fontFamily:F}}>✕</button>
+            </div>
+          ):(
+            <button onClick={()=>{setStepInput(String(manualSteps||""));setEditing(true);}} style={{display:"flex",alignItems:"center",justifyContent:"center",gap:8,width:"100%",marginTop:16,padding:"12px",background:"#1E1C1A",border:"1px solid #2A2725",borderRadius:12,color:dim,fontSize:12,fontWeight:600,cursor:"pointer",fontFamily:F}}>
+              <span style={{fontSize:16}}>👟</span>
+              {manualSteps>0?`Update step count (${manualSteps.toLocaleString()} from Health)`:"Enter steps from Health app"}
+            </button>
+          )
+        )}
+
+        {/* DeviceMotion pedometer indicator */}
+        {pedometer.source==="motion"&&pedometer.active&&<div style={{display:"flex",alignItems:"center",justifyContent:"center",gap:5,marginTop:12}}>
           <span style={{width:5,height:5,borderRadius:"50%",background:"#22C55E",boxShadow:"0 0 6px #22C55E",animation:"pulse 1.5s infinite"}}/>
           <span style={{fontSize:9,color:"#4ADE80",fontWeight:600,letterSpacing:"0.06em",textTransform:"uppercase"}}>+{pedometer.steps} from pedometer</span>
         </div>}
@@ -558,7 +625,8 @@ export default function App(){
   const pedometer=usePedometer();
   const{incoming,newFriends}=useFriendRequests(profile?.code);
 
-  const totalSteps=manualSteps+(pedometer.active?pedometer.steps:0);
+  const isHealthKit=pedometer.source==="healthkit";
+  const totalSteps=isHealthKit?pedometer.steps:(manualSteps+(pedometer.active?pedometer.steps:0));
   const stepCal=stepCals(totalSteps,profile?.weight||70);
   const actCal=activities.reduce((s,a)=>s+a.cals,0);
   const totalPints=(stepCal+actCal)/PINT_CALS;
